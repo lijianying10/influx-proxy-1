@@ -13,18 +13,21 @@ import (
 	"os"
 	"time"
 
-	lumberjack "gopkg.in/natefinch/lumberjack.v2"
-	redis "gopkg.in/redis.v5"
+	"gopkg.in/natefinch/lumberjack.v2"
+	"gopkg.in/redis.v5"
 
 	"github.com/eleme/influx-proxy/backend"
+	"strings"
 )
 
 var (
-	ErrConfig   = errors.New("config parse error")
-	ConfigFile  string
-	NodeName    string
-	RedisAddr   string
-	LogFilePath string
+	ErrConfig        = errors.New("config parse error")
+	ConfigFile       string
+	NodeName         string
+	RedisAddr        string
+	LogFilePath      string
+	EtcdEndpoints    string
+	EtcdConfigPrefix string
 )
 
 func init() {
@@ -33,7 +36,9 @@ func init() {
 	flag.StringVar(&LogFilePath, "log-file-path", "/var/log/influx-proxy.log", "output file")
 	flag.StringVar(&ConfigFile, "config", "", "config file")
 	flag.StringVar(&NodeName, "node", "l1", "node name")
-	flag.StringVar(&RedisAddr, "redis", "localhost:6379", "config file")
+	flag.StringVar(&RedisAddr, "redis", "localhost:6379", "redis endpoint")
+	flag.StringVar(&EtcdEndpoints, "etcd", "http://127.0.0.1:2379", "etcd endpoint")
+	flag.StringVar(&EtcdConfigPrefix, "perfix", "/", "etcd config path prefix Example :/wgIDC/clusterA")
 	flag.Parse()
 }
 
@@ -86,20 +91,38 @@ func main() {
 		cfg.Node = NodeName
 	}
 
+	var ic *backend.InfluxCluster
+	var nodecfg backend.NodeConfig
+
 	if RedisAddr != "" {
 		cfg.Addr = RedisAddr
+
+		rcs := backend.NewRedisConfigSource(&cfg.Options, cfg.Node)
+
+		nodecfg, err = rcs.LoadNode()
+		if err != nil {
+			log.Printf("config source load failed.")
+			return
+		}
+
+		ic = backend.NewInfluxCluster(rcs, &nodecfg)
+		ic.LoadConfig()
+	} else {
+		if EtcdEndpoints == "" {
+			log.Fatal("no dateabase select")
+		}
+
+		ecs := backend.NewEtcdConfigSource(EtcdConfigPrefix, cfg.Node, strings.Split(EtcdEndpoints, ";"))
+
+		nodecfg, err = ecs.LoadNode()
+		if err != nil {
+			log.Printf("config source load failed.")
+			return
+		}
+
+		ic = backend.NewInfluxCluster(ecs, &nodecfg)
+		ic.LoadConfig()
 	}
-
-	rcs := backend.NewRedisConfigSource(&cfg.Options, cfg.Node)
-
-	nodecfg, err := rcs.LoadNode()
-	if err != nil {
-		log.Printf("config source load failed.")
-		return
-	}
-
-	ic := backend.NewInfluxCluster(rcs, &nodecfg)
-	ic.LoadConfig()
 
 	mux := http.NewServeMux()
 	NewHttpService(ic, nodecfg.DB).Register(mux)

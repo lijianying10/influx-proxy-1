@@ -12,6 +12,10 @@ import (
 	"strings"
 
 	"gopkg.in/redis.v5"
+	"github.com/coreos/etcd/clientv3"
+	"time"
+	"path"
+	"encoding/json"
 )
 
 const (
@@ -51,14 +55,14 @@ func LoadStructFromMap(data map[string]string, o interface{}) (err error) {
 }
 
 type NodeConfig struct {
-	ListenAddr   string
-	DB           string
-	Zone         string
-	Nexts        string
-	Interval     int
-	IdleTimeout  int
-	WriteTracing int
-	QueryTracing int
+	ListenAddr   string `json:"listen_addr"`
+	DB           string `json:"db"`
+	Zone         string `json:"zone"`
+	Nexts        string `json:"nexts"`
+	Interval     int    `json:"interval"`
+	IdleTimeout  int    `json:"idle_timeout"`
+	WriteTracing int    `json:"write_tracing"`
+	QueryTracing int    `json:"query_tracing"`
 }
 
 type BackendConfig struct {
@@ -74,17 +78,16 @@ type BackendConfig struct {
 	WriteOnly       int
 }
 
+type ConfigSource interface {
+	LoadNode() (nodecfg NodeConfig, err error)
+	LoadBackends() (backends map[string]*BackendConfig, err error)
+	LoadMeasurements() (m_map map[string][]string, err error)
+}
+
 type RedisConfigSource struct {
 	client *redis.Client
 	node   string
 	zone   string
-}
-
-type ConfigSource interface {
-	LoadNode() (nodecfg NodeConfig, err error)
-	LoadBackends() (backends map[string]*BackendConfig, err error)
-	LoadConfigFromRedis(name string) (cfg *BackendConfig, err error)
-	LoadMeasurements() (m_map map[string][]string, err error)
 }
 
 func NewRedisConfigSource(options *redis.Options, node string) (rcs *RedisConfigSource) {
@@ -135,7 +138,7 @@ func (rcs *RedisConfigSource) LoadBackends() (backends map[string]*BackendConfig
 	var cfg *BackendConfig
 	for _, name := range names {
 		name = name[2:len(name)]
-		cfg, err = rcs.LoadConfigFromRedis(name)
+		cfg, err = rcs.loadConfigFromRedis(name)
 		if err != nil {
 			log.Printf("read redis config error: %s", err)
 			return
@@ -146,7 +149,7 @@ func (rcs *RedisConfigSource) LoadBackends() (backends map[string]*BackendConfig
 	return
 }
 
-func (rcs *RedisConfigSource) LoadConfigFromRedis(name string) (cfg *BackendConfig, err error) {
+func (rcs *RedisConfigSource) loadConfigFromRedis(name string) (cfg *BackendConfig, err error) {
 	val, err := rcs.client.HGetAll("b:" + name).Result()
 	if err != nil {
 		log.Printf("redis load error: b:%s", name)
@@ -199,6 +202,87 @@ func (rcs *RedisConfigSource) LoadMeasurements() (m_map map[string][]string, err
 		if err != nil {
 			return
 		}
+	}
+	log.Printf("%d measurements loaded from redis.", len(m_map))
+	return
+}
+
+type EtcdConfigSource struct {
+	// Etcd Config prefix example : /wgIDC/influxClusterA/
+	prefix        string
+	etcdEndpoints []string
+	node          string
+
+	etcdClient *clientv3.Client
+}
+
+func NewEtcdConfigSource(prefix, node string, etcdEndpoints []string) *EtcdConfigSource {
+	eclient, err := clientv3.New(clientv3.Config{
+		Endpoints:   etcdEndpoints,
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return &EtcdConfigSource{
+		prefix:        prefix,
+		etcdEndpoints: etcdEndpoints,
+		node:          node,
+		etcdClient:    eclient,
+	}
+}
+
+func (ecs *EtcdConfigSource) LoadNode() (nodecfg NodeConfig, err error) {
+	resp, err := ecs.etcdClient.Get(ecs.etcdClient.Ctx(), path.Join(ecs.prefix, ecs.node))
+	if err != nil {
+		return
+	}
+
+	if resp.Count != 1 {
+		err = errors.New("ERROR: config count mismatch")
+	}
+
+	err = json.Unmarshal(resp.Kvs[0].Value, &nodecfg)
+	log.Printf("node config loaded.")
+	return
+}
+
+func (ecs *EtcdConfigSource) LoadBackends() (backends map[string]*BackendConfig, err error) {
+	backends = make(map[string]*BackendConfig)
+
+	resp, err := ecs.etcdClient.Get(ecs.etcdClient.Ctx(), path.Join(ecs.prefix, "backends"))
+	if err != nil {
+		return
+	}
+
+	for _, kv := range resp.Kvs {
+		bkcfg := BackendConfig{}
+		err = json.Unmarshal(kv.Value, &bkcfg)
+		if err != nil {
+			return
+		}
+		backends[path.Base(string(kv.Key))] = &bkcfg
+	}
+	log.Printf("%d backends loaded from redis.", len(backends))
+	return
+}
+
+func (ecs *EtcdConfigSource) LoadMeasurements() (m_map map[string][]string, err error) {
+	m_map = make(map[string][]string)
+
+	resp, err := ecs.etcdClient.Get(ecs.etcdClient.Ctx(), path.Join(ecs.prefix, "measurements"))
+	if err != nil {
+		return
+	}
+
+	for _, kv := range resp.Kvs {
+		ms := []string{}
+		err = json.Unmarshal(kv.Value, &ms)
+		if err != nil {
+			return
+		}
+		m_map[path.Base(string(kv.Key))] = ms
 	}
 	log.Printf("%d measurements loaded from redis.", len(m_map))
 	return
