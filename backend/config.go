@@ -80,6 +80,13 @@ type RedisConfigSource struct {
 	zone   string
 }
 
+type ConfigSource interface {
+	LoadNode() (nodecfg NodeConfig, err error)
+	LoadBackends() (backends map[string]*BackendConfig, err error)
+	LoadConfigFromRedis(name string) (cfg *BackendConfig, err error)
+	LoadMeasurements() (m_map map[string][]string, err error)
+}
+
 func NewRedisConfigSource(options *redis.Options, node string) (rcs *RedisConfigSource) {
 	rcs = &RedisConfigSource{
 		client: redis.NewClient(options),
